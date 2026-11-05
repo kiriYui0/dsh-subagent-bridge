@@ -1,0 +1,273 @@
+---
+name: deepseek-worker
+description: 交给 DSH / 开个 worker 时使用；把自足任务当 subagent 派给 DeepSeek Harness：dsh_task 一次调用开会话、等这一轮干完、拿回结论。不用于几行改动或 DSH 未启动。
+---
+
+# 把任务交给 DSH（subagent 用法）
+
+DSH 是通过 `dsh-bridge` MCP 接上来的另一个编码代理。用法和"给自己开一个 subagent"一样：**给它一个自足的任务，等它把这一轮干完并返回结论。**
+
+> **最重要的一条：任务没跑完，不许结束回合。**
+> Codex 原生的 subagent 会把结果**推送**回来、自动唤醒你；这个桥是**拉取**式的 —— 你结束回合，结果就没人接收了，用户只能人工来叫你回去。所以：只要还有 `running` 的 worker，就必须继续调 `dsh_wait`（或 `dsh_read_result` 看过程），直到全部到终态。
+
+> **单次调用最长 240 秒。** Codex 的 MCP 客户端在 **300 秒**时会把工具调用判为失败（`timed out awaiting tools/call after 300s`）。所以 `timeoutSeconds` / `timeoutMs` / `waitSeconds` 一律不要超过 240，超了也不会生效（会被夹到 240）。
+
+## 先确认工具在
+
+工具列表里应当有：`dsh_task`、`dsh_spawn`、`dsh_wait`、`dsh_followup`、`dsh_close`、`dsh_list_workers`、`dsh_dispatch`、`dsh_read_result`、`dsh_list_sessions`。
+
+- 没有 `dsh_task` → DSH 没启动或 MCP 未接入。直接告诉用户"需要先启动 DeepSeek Harness"，**不要假装调用成功**。
+- 调用报连接错误 → 报错误原文，然后自己把这件事做掉，不要反复重试。
+
+## 默认动作：`dsh_task`
+
+```jsonc
+dsh_task({
+  "prompt": "自足的任务描述 + 验收标准",
+  "cwd": "/Users/.../当前仓库"          // 当前项目根目录
+})
+```
+
+返回：
+
+```jsonc
+{
+  "sessionId": "session-…",   // 续做时用它
+  "created": true,
+  "status": "completed",       // completed | turn-<reason> | timeout
+  "text": "worker 的最终回答",
+  "turns": 3,
+  "durationMs": 42000
+}
+```
+
+`dsh_task` **阻塞到 DSH 那一轮结束**再返回，最多等 **240 秒**（默认值，也是上限）。超时它不会假装成功，而是明确告诉你还在跑：
+
+```jsonc
+{ "status": "timeout", "running": true, "text": "",
+  "next": "the worker is still running; do not end the turn. Call dsh_wait(...) and repeat until it is not running." }
+```
+
+**看到 `running: true` 就继续等**，不要结束回合、也不要把空 `text` 当成"它没干成"。
+
+继续等**只能用 `dsh_wait`**：
+
+```jsonc
+dsh_wait({ "targets": ["session-…或 task_name"], "timeoutMs": 240000 })
+```
+
+不要用 `dsh_task` 续等。它有两个坑：
+
+- worker 还在跑时，`dsh_task({sessionId})` 会被直接拒绝（`that session is running`）；
+- worker 已经跑完时，`dsh_task({sessionId, prompt:"继续"})` 会**又派一条消息**，多花一次钱、还可能让对方重做一遍。
+
+## 多件活：并行开 worker
+
+互不依赖的子任务，**并行比串行快**，而且往往质量更好（每个 worker 有干净的上下文）。这是 Codex 自己多智能体策略的原话，照抄过来：
+
+> 只要并行能省时间或提高质量，就应该把任务分出去（无论你是主 agent 还是子 agent）。
+
+流程：
+
+```jsonc
+// 1. 一次开多个，每个都立刻返回，不等结果
+dsh_spawn({ "task_name": "audit_api",   "message": "审 src/api/**，只出问题清单" })
+dsh_spawn({ "task_name": "audit_store", "message": "审 src/store/**，只出问题清单" })
+dsh_spawn({ "task_name": "run_tests",   "message": "跑全量测试，只报失败用例" })
+
+// 2. 等任意一个先完成（谁先好先用，不必等全部）
+dsh_wait({ "targets": ["audit_api", "audit_store", "run_tests"], "timeoutMs": 300000 })
+// → { "status": { "audit_api": { "completed": "…" }, "audit_store": "running", … } }
+
+// 3. 处理已完成的，继续等剩下的；完工的记得关掉
+dsh_close({ "worker": "audit_api" })
+```
+
+**规则（与 Codex 一致）**
+
+- **并发上限 4 个 worker**（`maxWorkers`）。**已完成但没 `dsh_close` 的也占名额** —— 用完就关，别一直挂着。
+- `dsh_task` 是阻塞的、一次一件；它**不占**那 4 个名额，适合"我就等着这一件"。
+- `dsh_wait` 每次给满 **240000**（毫秒）。**它返回 `timedOut: true` / 仍有 `"running"` 时，不代表结束，只代表"还没好"** —— 继续调它，直到没有任何 target 是 `running`/`pending`。短超时反复轮询是错的（Codex 原话：prefer longer waits (minutes) to avoid busy polling）。
+- `dsh_wait` 只要**任意一个**到终态就返回，所以它是"收割完成项"的循环，而不是"等全部"。
+
+**不要并行的情况**
+
+- 任务之间**有先后依赖**（B 要用 A 的结论）。
+- 多个 worker 要改**同一批文件**：它们各自在自己的会话里，但落在同一个仓库，并发改同一文件会互相覆盖。要并行就按目录/模块切分，并在 prompt 里写死各自的边界。
+- 你还没想清楚验收标准 —— 先想清楚再拆，否则只是把混乱放大 4 倍。
+
+**需要上下文时**
+
+```jsonc
+dsh_spawn({ "task_name": "continue_here", "fork_turns": "all",
+            "from": "session-…",            // 既有 DSH 会话
+            "message": "接着这个会话继续修那个失败用例" })
+```
+
+`fork_turns: "all"` 会 fork 那个会话作为 worker 的起点（继承到最近一个已完成 turn），worker 的后续改动**不会**污染原会话。默认 `"none"` 是全新空会话。
+
+
+## 让它自己并行（DSH 也有 subagent）
+
+DSH **自带** `subagent` 工具（和这座桥无关，是它自己的能力，worker 在深度 0，可以开子 agent）。但它**默认不会用**——不提示就一个人串行干完。
+
+任务能拆成互不依赖的几块时，在 prompt 末尾加一句：
+
+> 这几块互不依赖，可以用你自己的 subagent 并行处理，最后汇总。
+
+实测：4 个互不依赖的乘法 + 这句提示 → 它开了 **4 个 subagent 并行**，43 秒返回汇总，结果全对。不加这句，同样的活它串行做完。
+
+判断标准和 Codex 的 proactive 策略一致：
+
+- ✅ 子任务互不依赖、并行能省时间或提高质量 → 加这句
+- ❌ 有先后依赖、要改同一批文件、验收标准还没想清 → 不要加，串行更稳
+
+DSH 自己的委派深度上限是 1：worker（depth 0）能开子 agent（depth 1），子 agent 不能再往下开。所以不会无限递归。
+
+## 指定 worker 用哪个模型
+
+`dsh_task`、`dsh_spawn`、`dsh_followup` 都支持 `model`。默认不传，worker 跟随会话默认模型。
+
+```json
+{ "prompt": "…", "cwd": "/repo", "model": "zai-coding-cn/glm-5.3", "reasoningEffort": "max" }
+```
+
+- 写法是 **`provider/model`**，中间一个斜杠；
+- **只写模型名**（`"glm-5.3"`）会沿用当前默认 provider——省事但容易踩空，见下；
+- `reasoningEffort` 可选，取值随模型（`low` / `medium` / `high` / `max` 等），模型不支持该档会直接报错；
+- 不传 `model` 的调用行为完全不变，不要为了"保险"而乱传。
+
+什么时候值得指定：
+
+| 场景 | 做法 |
+| --- | --- |
+| 任务要长上下文 / 大文件 | 挑窗口大的模型 |
+| 要跨模型复核同一件事 | 第二次派发换另一家的模型 |
+| 便宜模型够用（改文档、跑格式） | 显式指定小模型省钱 |
+| 用同一个 worker 干不同类型活 | `dsh_followup` 里换 `model` |
+
+**只写模型名的坑**：`glm-5.3`、`deepseek-v4.1-flash` 这类模型同时挂在多个 provider 下（`zai-coding-cn`、`opencode-go`、`newapi`…），只写名字会落到当前默认 provider 上，可能和你想的不是同一家。**要么写全 `provider/model`，要么先确认当前默认是什么。**
+
+写错了（`/glm-5.3`、`a/b/c`）桥会在**发 prompt 之前**报错，不会白跑一轮。
+
+
+## 新建项目：`workspace`
+
+DSH 侧边栏的分组叫「项目（workspace）」，和会话的工作目录是两回事。桥默认只**复用**已有项目：`cwd` 恰好是一个项目的目录，会话就归进去；否则落在「未分组」。
+
+要在 DSH 里**新建**一个和 Codex 这边对等的项目，加 `workspace`：
+
+```json
+{ "prompt": "…", "cwd": "/repo/clawer", "workspace": true }
+{ "prompt": "…", "cwd": "/repo/clawer", "workspace": "Clawer" }
+```
+
+- `true` → 用 `cwd` 建项目，标题取目录名；
+- 字符串 → 同上，但用这个标题；
+- 目录已是项目 → **复用，不改标题**，不会重复创建；
+- 目录不存在 → 先建目录再登记项目；
+- 不传 → 只复用，没有项目就未分组（默认行为）。
+
+**什么时候传**：用户说「创建一个 xxx 项目」「在 DSH 里也建一个」「别让它落到未分组」时。单纯派活、目录已经是项目时不用传——传了也只是复用。
+
+返回里带 `workspace: { id, title, path }`，可以据此确认落在哪个项目下。
+
+
+## 怎么写 prompt
+
+worker **看不到你这段对话**，它只有 `prompt` 和 `cwd`。写成可以独立开工的工单：
+
+1. **背景一句话**：什么项目、要解决什么。
+2. **具体改动**：文件/模块/行为，能给路径就给。
+3. **验收标准**：跑什么命令、期望什么结果（例如 `pnpm vitest` 全绿）。
+4. **边界**：不要动哪些文件、不要改哪些接口、不要提交或推送。
+5. **输出要求**：结尾几行说明"改了什么、怎么验证、还有什么风险"。
+
+不要写"按上面的讨论去做"——worker 没有你的上下文。
+
+## prompt 的红线
+
+worker 收到的是**一条普通用户消息**，它看不到你这边有没有技能、叫什么名字。所以：
+
+- ❌ 不要把技能名、工具名写进 prompt：`用户明确要求使用 deepseek-worker 写…`、`请用 dsh_task 执行…`、`你是 deepseek-worker 子代理…`
+- ❌ 不要给它派角色或交代你们的协作机制：`你现在是一个 subagent，完成后回调…`
+- ❌ 不要复述用户的元指令：`用户说了要 DeepSeek 来做，所以…`
+- ✅ 只写**任务本身**：目标、位置、验收标准、边界。
+
+用户如果说「用 deepseek-worker 写个冒泡」，你派出去的那句话应该只是：
+
+```
+用 Python 实现 bubble_sort(nums)：原地升序、相邻比较交换、无交换提前结束；
+附调用示例；覆盖空列表/单元素/重复值/负数/已排序/逆序；不读写文件、不执行命令。
+```
+
+一旦 prompt 里出现 `deepseek-worker`，worker 会以为那是它自己的技能或工具，白费一轮去确认「本会话没有这个技能」。
+
+## 收工的判断标准
+
+下面三件事同时成立，才可以结束回合：
+
+1. 所有派出去的 worker 状态都是 `{completed}` / `{errored}` / `"closed"` / `"not_found"` / `"offline"`；
+2. 没有任何 worker 是 `"running"` 或 `"pending"`；
+3. 你已经对每个完成的 worker 做过必要的复核（跑测试、看 diff）。
+
+只要还有 `running`，就继续 `dsh_wait`。**宁可多等一轮，也不要留一个没人收的 worker。**
+
+## 拿到结果之后
+
+- `completed` → 读 `text`，判断是否真的达成交付；需要复核就自己跑一遍验证命令。
+- `turn-…`（如 `turn-aborted`、`turn-error`）→ 那一轮没正常结束，把 `text` 里的信息转述给用户，必要时自己接手。
+- `timeout`（带 `running: true`）→ 工作**没有丢**，DSH 那边还在跑。**必须继续等**：`dsh_wait({targets:[…]})`，直到不是 running。**不要**用 `dsh_task` 续等（运行中会被拒绝，跑完则会多派一条消息）。
+
+## 同一个 worker 继续干
+
+```jsonc
+dsh_followup({ "worker": "audit_api", "message": "把第 3 条展开，给出补丁" })
+```
+
+`dsh_followup` 复用该 worker 的会话，比新开一个便宜。要**阻塞等结果**用 `dsh_wait`，不要用 `dsh_task` —— 它看到运行中的会话会拒绝，跑完则会多派一条消息。
+
+## 改主意时：排队还是插话
+
+默认是**排队发送**：等 worker 当前这一轮跑完，再作为新的一轮处理。DSH 的「繁忙时的发送行为」还提供**插话发送**，桥用 `mode` 暴露它：
+
+```jsonc
+// 排队（默认）：等这一轮结束
+dsh_followup({ "worker": "w1", "message": "跑完顺手看一下测试覆盖率" })
+
+// 插话：并入当前这一轮，模型下一步就能看到
+dsh_followup({ "worker": "w1", "message": "接下来只改 src 下的文件，别动 packages", "mode": "steer" })
+```
+
+| `mode` | 行为 | 什么时候用 |
+| --- | --- | --- |
+| `queue`（默认） | 等这一轮结束，新开一轮 | 「顺便」「另外」 |
+| `steer` | 并入当前一轮，**turn 不重开** | 「接下来注意…」「只改某某」 |
+
+**`steer` 不会打断正在执行的工具**：worker 若正卡在 `sleep 90` 这类调用里，消息要等它返回到下一步才被看到（实测 70 秒）。要它立刻停，那是用户在 DSH 界面上按取消，不是这里的投递模式——不要用 `steer` 假装能"打断"。
+
+用户说「停下来/别做了」时，正确反应是：告诉用户这会让当前这轮中止，或者用 `dsh_wait` 等它自然结束——不要依赖 `mode` 去实现"立即停"。
+
+## 查现在有哪些 worker
+
+```jsonc
+dsh_list_workers()   // [{ task_name, sessionId, status }, …]
+```
+
+`status` 是 `"running"` / `"pending"` / `{completed}` / `{errored}` / `"closed"` / `"offline"`（重启后会话没打开且无缓存结果）。**重启 App 之后这些记录仍在**（落在 `~/.dsh/bridge/workers.json`）。
+
+## 低阶工具（一般不用）
+
+只有"给一个已在用的 DSH 会话留言"才用：`dsh_dispatch` 投递、`dsh_read_result` 长轮询取回。日常派活一律 `dsh_task`。
+
+## 回报给用户
+
+三句话以内：派给了谁（新 worker / 某 session）、结果如何（`status` + 核心结论）、下一步建议。**不要把 worker 的长文整段贴回来**。
+
+## 不要做
+
+- 不要把密钥、私有凭据写进 `prompt`——它会进入 DSH 的会话日志。
+- 不要让 worker 操作你的本地环境（它有自己的权限与目录）。
+- 不要把三件不相关的事塞进一次调用；拆开更可控（也可以直接并行）。
+- 不要超过 4 个 worker，也不要让已完成的 worker 一直挂着不关。
+- 不要在 DSH 未启动时假装委派成功。

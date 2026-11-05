@@ -1,0 +1,58 @@
+{
+  "name": "dsh-subagent-bridge",
+  "version": "0.22.0",
+  "type": "module",
+  "description": "Subagent bridge: lets Codex delegate a task to DeepSeek Harness the way it would spawn a subagent (one call, waits for the answer), plus a codex_dispatch tool for the reverse direction.",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek",
+    "harness",
+    "mcp",
+    "bridge",
+    "codex"
+  ],
+  "author": "Dogtiti",
+  "license": "MIT",
+  "homepage": "https://github.com/kiriYui0/dsh-subagent-bridge#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kiriYui0/dsh-subagent-bridge"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "src/**/*.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "skills/*/SKILL.md",
+    "README.md",
+    "README.zh-CN.md",
+    "test/**/*.mjs",
+    "CONTEXT-TOOLS.md"
+  ],
+  "engines": {
+    "dsh": "^0.2.1-0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "bugs": {
+    "url": "https://github.com/kiriYui0/dsh-subagent-bridge/issues"
+  },
+  "contributors": [
+    {
+      "name": "kiriYui0",
+      "url": "https://github.com/kiriYui0"
+    }
+  ]
+}
