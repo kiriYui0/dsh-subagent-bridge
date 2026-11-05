@@ -33,7 +33,8 @@
     "README.md",
     "README.zh-CN.md",
     "test/**/*.mjs",
-    "CONTEXT-TOOLS.md"
+    "CONTEXT-TOOLS.md",
+    "INSTALL.md"
   ],
   "engines": {
     "dsh": "^0.2.1-0"
